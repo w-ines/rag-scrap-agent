@@ -49,17 +49,55 @@ def search_duckduckgo(query: str, max_results: int = 8) -> List[Dict[str, Any]]:
     """Recherche en utilisant DuckDuckGo."""
     try:
         results = []
-        with DDGS() as ddgs:
-            ddgs_results = ddgs.text(query, max_results=max_results)
-            for r in ddgs_results:
-                results.append({
-                    "link": r.get("href", ""),
-                    "title": r.get("title", ""),
-                    "text": [r.get("body", "")],
-                })
+        
+        # Try multiple approaches for better reliability
+        # Prioritize English-speaking regions to avoid Chinese/non-English results
+        attempts = [
+            # Attempt 1: US region (best for English results)
+            lambda: DDGS().text(query, max_results=max_results, region='us-en', safesearch='off'),
+            # Attempt 2: UK region (fallback English)
+            lambda: DDGS().text(query, max_results=max_results, region='uk-en', safesearch='off'),
+            # Attempt 3: Worldwide (last resort, may return Chinese results)
+            lambda: DDGS().text(query, max_results=max_results, region='wt-wt', safesearch='off'),
+        ]
+        
+        for attempt_num, attempt_func in enumerate(attempts, 1):
+            try:
+                logger.debug(f"DuckDuckGo attempt {attempt_num}/{len(attempts)}")
+                ddgs_results = attempt_func()
+                
+                # Convert generator to list to check if empty
+                ddgs_list = list(ddgs_results) if ddgs_results else []
+                
+                if ddgs_list:
+                    logger.info(f"DuckDuckGo attempt {attempt_num} succeeded: {len(ddgs_list)} results for query: '{query}'")
+                    
+                    for r in ddgs_list:
+                        result_item = {
+                            "link": r.get("href", ""),
+                            "title": r.get("title", ""),
+                            "text": [r.get("body", "")],
+                        }
+                        results.append(result_item)
+                        logger.debug(f"  - {result_item['title'][:50]}... | {result_item['link']}")
+                    
+                    return results  # Success, return immediately
+                else:
+                    logger.debug(f"DuckDuckGo attempt {attempt_num} returned no results")
+                    
+            except Exception as attempt_error:
+                logger.debug(f"DuckDuckGo attempt {attempt_num} failed: {str(attempt_error)}")
+                continue
+        
+        # All attempts failed
+        logger.warning(f"DuckDuckGo search returned no results after {len(attempts)} attempts for query: '{query}'")
+        logger.warning("This might be due to rate limiting, bot detection, network issues, or the query returning no matches")
+        logger.warning("Suggestion: Try using a different search provider (Google/Bing) by setting SEARCH_PROVIDER env variable")
+        
         return results
     except Exception as e:
         logger.error(f"DuckDuckGo search error: {str(e)}")
+        logger.error(f"Query was: '{query}'")
         return []
 
 def search_google(query: str, max_results: int = 8) -> List[Dict[str, Any]]:
@@ -129,7 +167,7 @@ def search_custom(query: str, max_results: int = 8) -> List[Dict[str, Any]]:
     Implémentation d'un moteur de recherche personnalisé.
     Modifiez cette fonction pour intégrer votre propre API de recherche.
     """
-    # Exemple d'implémentation à personnaliser
+    # Example implementation to customize
     try:
         custom_url = os.environ.get("CUSTOM_SEARCH_URL")
         custom_key = os.environ.get("CUSTOM_SEARCH_KEY")
@@ -150,7 +188,7 @@ def search_custom(query: str, max_results: int = 8) -> List[Dict[str, Any]]:
         response.raise_for_status()
         
         data = response.json()
-        # Adaptez cette partie à la structure de réponse de votre API
+        # Adapt this part to your API response structure
         results = []
         for item in data.get("results", [])[:max_results]:
             results.append({

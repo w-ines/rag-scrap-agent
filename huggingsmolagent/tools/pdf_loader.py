@@ -6,11 +6,23 @@ from langchain_community.document_loaders import PyPDFLoader, PyMuPDFLoader
 import fitz  # PyMuPDF for rendering
 import pytesseract
 from PIL import Image
-from langchain.schema import Document
+from langchain_core.documents import Document
 
 
 def _filter_nonempty(docs: List[Document]) -> List[Document]:
-    return [d for d in docs if (d.page_content or "").strip()]
+    """Filter out empty documents and normalize text"""
+    import re
+    filtered = []
+    for d in docs:
+        content = (d.page_content or "").strip()
+        if content:
+            # Fix OCR spacing issues where spaces appear between characters
+            # Pattern 1: Remove spaces within words that have excessive spacing
+            content = re.sub(r'(?<=\w)\s+(?=\w(?:\s+\w){2,})', '', content)
+            # Pattern 2: Fix remaining single-letter words followed by spaces
+            content = re.sub(r'\b(\w)\s+(?=\w\b)', r'\1', content)
+            filtered.append(Document(page_content=content, metadata=d.metadata))
+    return filtered
 
 
 def parse_pdf(upload: UploadFile) -> List[Document]:

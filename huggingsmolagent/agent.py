@@ -14,6 +14,7 @@ except Exception:
 # from huggingsmolagent.tools.retrieval_tool import RetrieverTool
 from huggingsmolagent.tools.scraper import webscraper, web_search
 from huggingsmolagent.tools.vector_store import retrieve_knowledge
+from huggingsmolagent.tools.weather import get_weather, get_weather_simple
 import os.path
 import logging
 import os
@@ -811,17 +812,68 @@ async def generate_streaming_response(request_data: ComplexRequest):
         
         # Configure the agent with tools and settings
         logger.debug("Setting up tools for CodeAgent")
+        
+        # Custom instructions for better RAG handling
+        # These will be injected into the system prompt via the instructions parameter
+        custom_rag_instructions = """
+
+IMPORTANT: You MUST respond in English only. Never use Chinese or any other language in your responses.
+
+CRITICAL RULES FOR DOCUMENT HANDLING:
+=====================================
+
+When you see context indicating files were uploaded (e.g., "[Context: User just uploaded X file(s): filename.pdf]"):
+
+1. ✅ The files are ALREADY indexed in the Supabase vector database
+2. ✅ You MUST use retrieve_knowledge() to access document content
+3. ❌ DO NOT try to use: pdf_reader(), file_reader(), open(), or any file I/O
+4. ❌ These file operations DO NOT EXIST and will fail
+
+Correct workflow for document tasks:
+-----------------------------------
+Task: "summarize this document [Context: User just uploaded file.pdf]"
+
+Step 1 - Retrieve content:
+{{code_block_opening_tag}}
+result = retrieve_knowledge(query="document summary", top_k=20)
+print(f"Retrieved {len(result['results'])} chunks")
+print(result['context'][:1000])  # Preview content
+{{code_block_closing_tag}}
+
+Step 2 - Analyze and synthesize:
+{{code_block_opening_tag}}
+# Use the retrieved context to create summary
+# The result['context'] contains all document text with sources
+summary = "Based on the document [1][2][3]..."
+final_answer(summary)
+{{code_block_closing_tag}}
+
+Remember: retrieve_knowledge() returns a dict with:
+- results: list of dicts, each with keys: 'content' (text), 'metadata' (dict), 'score' (float)
+- sources: list of source references for citations
+- context: formatted text ready for analysis (USE THIS DIRECTLY!)
+- instructions: how to cite sources
+
+IMPORTANT: Each chunk in results has a 'content' key, NOT 'text'!
+Example: chunk['content'] ✅  chunk['text'] ❌
+
+BEST PRACTICE: Use result['context'] directly instead of manually iterating chunks!
+Always cite sources using [1], [2], etc. as shown in the instructions field.
+"""
+        
         agent = CodeAgent(
             tools=[
-                webscraper,
+                get_weather_simple,
                 web_search,
+                webscraper,
                 retrieve_knowledge,
             ],
             model=llm_model,
             add_base_tools=True,
             max_steps=8,
             verbosity_level=2,  # Ensures thoughts/actions are in the output string
-            step_callbacks=[step_tracker], 
+            step_callbacks=[step_tracker],
+            instructions=custom_rag_instructions,  # Use instructions parameter (not custom_instructions)
             additional_authorized_imports=[
                 'requests', 
                 'bs4',
@@ -846,6 +898,8 @@ async def generate_streaming_response(request_data: ComplexRequest):
         # Run agent in thread and stream steps
         agent_result = None
         agent_error = None
+        agent_start_time = time.time()
+        AGENT_TIMEOUT = 300  # 5 minutes - reasonable timeout for most queries
         
         def run_agent():
             nonlocal agent_result, agent_error
@@ -865,6 +919,14 @@ async def generate_streaming_response(request_data: ComplexRequest):
         
         # Stream steps as they come from the queue
         while not agent_finished.is_set() or not step_queue.empty():
+            # Check for timeout
+            elapsed = time.time() - agent_start_time
+            if elapsed > AGENT_TIMEOUT:
+                logger.error(f"⏱️ Agent timeout after {elapsed:.1f}s (limit: {AGENT_TIMEOUT}s)")
+                agent_error = TimeoutError(f"Agent execution exceeded {AGENT_TIMEOUT}s timeout")
+                agent_finished.set()
+                break
+            
             try:
                 # Try to get step from queue with timeout
                 step = step_queue.get(timeout=0.1)
@@ -883,12 +945,23 @@ async def generate_streaming_response(request_data: ComplexRequest):
                 await asyncio.sleep(0.1)
                 continue
         
-        # Wait for agent to complete
-        agent_thread.join()
+        # Wait for agent to complete (with timeout)
+        agent_thread.join(timeout=5)
         
         # Check for errors
         if agent_error:
-            raise agent_error
+            # Send error message to frontend
+            error_msg = str(agent_error)
+            if isinstance(agent_error, TimeoutError):
+                error_msg = f"⏱️ The task took too long to complete (>{AGENT_TIMEOUT}s). Try simplifying your question or asking for specific information."
+            
+            error_data = {
+                "steps": [],
+                "response": error_msg,
+                "error": True
+            }
+            yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n"
+            return
 
         # Process final response
         # Convert output to string for processing
@@ -1033,7 +1106,7 @@ def run_agent_sync(query: str) -> str:
     The agent will decide which tools to use (RAG, summarize, scrape) based on the query.
     
     Args:
-        query: User question/request
+        query: User question/request (may include context from main.py)
         
     Returns:
         str: Agent's final answer
@@ -1049,13 +1122,62 @@ def run_agent_sync(query: str) -> str:
         )
         
         # All available tools - agent will choose which to use
-        tools = [web_search, webscraper, retrieve_knowledge]
+        tools = [get_weather_simple, web_search, webscraper, retrieve_knowledge]
+        
+        # Custom instructions for better RAG handling (same as streaming version)
+        # These will be injected into the system prompt via the instructions parameter
+        custom_rag_instructions = """
+
+IMPORTANT: You MUST respond in English only. Never use Chinese or any other language in your responses.
+
+CRITICAL RULES FOR DOCUMENT HANDLING:
+=====================================
+
+When you see context indicating files were uploaded (e.g., "[Context: User just uploaded X file(s): filename.pdf]"):
+
+1. ✅ The files are ALREADY indexed in the Supabase vector database
+2. ✅ You MUST use retrieve_knowledge() to access document content
+3. ❌ DO NOT try to use: pdf_reader(), file_reader(), open(), or any file I/O
+4. ❌ These file operations DO NOT EXIST and will fail
+
+Correct workflow for document tasks:
+-----------------------------------
+Task: "summarize this document [Context: User just uploaded file.pdf]"
+
+Step 1 - Retrieve content:
+<code>
+result = retrieve_knowledge(query="document summary", top_k=20)
+print(f"Retrieved {len(result['results'])} chunks")
+print(result['context'][:1000])  # Preview content
+</code>
+
+Step 2 - Analyze and synthesize:
+<code>
+# Use the retrieved context to create summary
+# The result['context'] contains all document text with sources
+summary = "Based on the document [1][2][3]..."
+final_answer(summary)
+</code>
+
+Remember: retrieve_knowledge() returns a dict with:
+- results: list of dicts, each with keys: 'content' (text), 'metadata' (dict), 'score' (float)
+- sources: list of source references for citations
+- context: formatted text ready for analysis (USE THIS DIRECTLY!)
+- instructions: how to cite sources
+
+IMPORTANT: Each chunk in results has a 'content' key, NOT 'text'!
+Example: chunk['content'] ✅  chunk['text'] ❌
+
+BEST PRACTICE: Use result['context'] directly instead of manually iterating chunks!
+Always cite sources using [1], [2], etc. as shown in the instructions field.
+"""
         
         agent = CodeAgent(
             tools=tools,
             model=model,
-            max_steps=10,
-            verbosity_level=2
+            max_steps=8,  # Reduced from 10 to prevent long error loops
+            verbosity_level=2,
+            instructions=custom_rag_instructions 
         )
         
         print(f"[agent_sync] Agent initialized with {len(tools)} tools")

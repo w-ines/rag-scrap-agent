@@ -21,17 +21,70 @@ from dotenv import load_dotenv
 load_dotenv()
 logger = logging.getLogger(__name__)
 
+def is_content_relevant(content: str, title: str, query: str) -> tuple[bool, str]:
+    """
+    Évalue si le contenu scrapé est pertinent pour la requête.
+    
+    Args:
+        content: Le texte scrapé
+        title: Le titre de la page
+        query: La requête de recherche originale
+        
+    Returns:
+        tuple: (is_relevant: bool, reason: str)
+    """
+    # Rejection criteria
+    MIN_CONTENT_LENGTH = 100
+    MAX_COOKIE_RATIO = 0.3  # Max 30% of content = cookies/consent
+    
+    # 1. Content too short
+    if len(content) < MIN_CONTENT_LENGTH:
+        return False, f"Content too short ({len(content)} chars)"
+    
+    # 2. Too many cookie/consent/GDPR mentions
+    cookie_keywords = ["cookie", "consent", "gdpr", "privacy policy", "accept", "we use cookies"]
+    cookie_count = sum(content.lower().count(kw) for kw in cookie_keywords)
+    if cookie_count > len(content.split()) * MAX_COOKIE_RATIO:
+        return False, f"Too many cookie/consent mentions ({cookie_count})"
+    
+    # 3. Mostly links/navigation content
+    link_indicators = ["login", "register", "subscribe", "sign up", "menu", "navigation"]
+    link_count = sum(content.lower().count(ind) for ind in link_indicators)
+    if link_count > 10 and len(content.split()) < 200:
+        return False, "Mostly navigation/links"
+    
+    # 4. Page error or empty content
+    error_indicators = ["404", "not found", "page not found", "access denied", "forbidden"]
+    if any(err in content.lower()[:500] for err in error_indicators):
+        return False, "Error page detected"
+    
+    # 5. Check if query keywords are present
+    query_words = set(query.lower().split())
+    # Ignore common words
+    stop_words = {"the", "a", "an", "in", "on", "at", "to", "for", "of", "and", "or", "is", "what", "how"}
+    query_words = query_words - stop_words
+    
+    if query_words:
+        content_lower = content.lower()
+        matches = sum(1 for word in query_words if word in content_lower)
+        match_ratio = matches / len(query_words)
+        
+        if match_ratio < 0.3:  # Less than 30% of keywords present
+            return False, f"Low keyword match ({match_ratio:.1%})"
+    
+    return True, "Content appears relevant"
+
 # Configuration for scraping strategy
 SCRAPING_CONFIG = {
-    'prefer_firecrawl': True,  # Garder Firecrawl actif
-    'firecrawl_timeout': 30,   # Timeout plus court pour Firecrawl (30s au lieu de 45s)
-    'firecrawl_wait_for': 5,   # Temps d'attente pour le chargement de la page (5s)
-    'requests_timeout': 25,    # Timeout pour BeautifulSoup (augmenté pour les retries)
-    'selenium_timeout': 30,    # Timeout pour Selenium
-    'max_retries': 2,          # 2 essais par méthode
-    'retry_delay': 1,          # Délai court entre retries
-    'fallback_enabled': True,  # Fallback vers autres méthodes
-    'fast_fallback': True,     # Passer rapidement aux alternatives en cas de timeout
+    'prefer_firecrawl': True,  # Keep Firecrawl active
+    'firecrawl_timeout': 30,   # Shorter timeout for Firecrawl (30s instead of 45s)
+    'firecrawl_wait_for': 5,   # Wait time for page loading (5s)
+    'requests_timeout': 25,    # Timeout for BeautifulSoup (increased for retries)
+    'selenium_timeout': 30,    # Timeout for Selenium
+    'max_retries': 2,          # 2 attempts per method
+    'retry_delay': 1,          # Short delay between retries
+    'fallback_enabled': True,  # Fallback to other methods
+    'fast_fallback': True,     # Quickly switch to alternatives on timeout
 }
 
 @tool
@@ -158,10 +211,10 @@ def retry_with_backoff(func, *args, max_retries=3, initial_delay=1, **kwargs):
     """
     Retry function with exponential backoff for handling timeouts.
     """
-    # Pour Firecrawl, utiliser un retry plus conservateur
+    # For Firecrawl, use more conservative retry
     func_name = func.__name__ if hasattr(func, '__name__') else str(func)
     if 'firecrawl' in func_name.lower():
-        max_retries = min(max_retries, 2)  # Maximum 2 essais pour Firecrawl
+        max_retries = min(max_retries, 2)  # Maximum 2 attempts for Firecrawl
     
     for attempt in range(max_retries):
         try:
@@ -176,16 +229,16 @@ def retry_with_backoff(func, *args, max_retries=3, initial_delay=1, **kwargs):
                 'request timeout', 'failed to scrape'
             ])
             
-            # Pour Firecrawl avec fast_fallback, échouer plus rapidement après 1 essai
+            # For Firecrawl with fast_fallback, fail faster after 1 attempt
             if ('firecrawl' in func_name.lower() and is_timeout and 
                 SCRAPING_CONFIG.get('fast_fallback', False) and attempt >= 0):
-                logger.warning(f"Firecrawl timeout - passage rapide à la méthode suivante: {str(e)}")
-                raise  # Passer rapidement à la méthode suivante
+                logger.warning(f"Firecrawl timeout - quickly switching to next method: {str(e)}")
+                raise  # Quickly switch to next method
             
             if not is_timeout or attempt == max_retries - 1:
                 raise  # Re-raise if not timeout or last attempt
             
-            delay = initial_delay * (1.2 ** attempt)  # Backoff très modéré
+            delay = initial_delay * (1.2 ** attempt)  # Very moderate backoff
             logger.warning(f"Timeout error on attempt {attempt + 1}/{max_retries}, retrying in {delay:.1f}s: {str(e)}")
             time.sleep(delay)
     
@@ -202,9 +255,20 @@ def use_firecrawl_optimized(url: str, extraction_prompt: str = None, css_selecto
         
         logger.debug(f"🔧 Firecrawl extraction_prompt: {extraction_prompt}")
         
+        # Check which method is available (API compatibility)
+        scrape_method = None
+        if hasattr(app, 'scrape_url'):
+            scrape_method = 'scrape_url'
+        elif hasattr(app, 'scrape'):
+            scrape_method = 'scrape'
+        else:
+            raise Exception("Firecrawl SDK version incompatible - no scrape method found. Please update: pip install --upgrade firecrawl")
+        
+        logger.debug(f"Using Firecrawl method: {scrape_method}")
+        
         if extraction_prompt:
-            # ✅ Use scrape_url with json format for extraction in v1 API
-            logger.info(f"🔥 Calling Firecrawl scrape_url with JSON extraction...")
+            # ✅ Use scrape method with json format for extraction
+            logger.info(f"🔥 Calling Firecrawl {scrape_method} with JSON extraction...")
             
             # Format the prompt properly for jsonOptions
             optimized_prompt_text = f"""
@@ -217,19 +281,33 @@ def use_firecrawl_optimized(url: str, extraction_prompt: str = None, css_selecto
             If the page contains links, include relevant URLs.
             """
 
-            # ✅ Correct v1 API format using scrape_url with json format
-            # Fix the waitFor parameter issue - use numeric value
-            result = app.scrape_url(
-                url=url,
-                formats=["json"],
-                json_options={
-                    "prompt": optimized_prompt_text.strip()
-                },
-                only_main_content=True,
-                timeout=SCRAPING_CONFIG.get('firecrawl_timeout', 30) * 1000,  # Convert to milliseconds
-                waitFor=SCRAPING_CONFIG.get('firecrawl_wait_for', 5) * 1000,  # Use configurable wait time in milliseconds
-                skip_tls_verification=True  # Ignorer les problèmes SSL qui peuvent causer des timeouts
-            )
+            # Call the appropriate method
+            if scrape_method == 'scrape_url':
+                result = app.scrape_url(
+                    url=url,
+                    formats=["json"],
+                    json_options={
+                        "prompt": optimized_prompt_text.strip()
+                    },
+                    only_main_content=True,
+                    timeout=SCRAPING_CONFIG.get('firecrawl_timeout', 30) * 1000,  # Convert to milliseconds
+                    waitFor=SCRAPING_CONFIG.get('firecrawl_wait_for', 5) * 1000,  # Use configurable wait time in milliseconds
+                    skip_tls_verification=True  # Ignore SSL issues that can cause timeouts
+                )
+            else:  # scrape method (older API)
+                # The scrape() method takes direct arguments, not a params dict
+                result = app.scrape(
+                    url,
+                    {
+                        "formats": ["json"],
+                        "extract": {
+                            "prompt": optimized_prompt_text.strip()
+                        },
+                        "onlyMainContent": True,
+                        "timeout": SCRAPING_CONFIG.get('firecrawl_timeout', 30) * 1000,
+                        "waitFor": SCRAPING_CONFIG.get('firecrawl_wait_for', 5) * 1000
+                    }
+                )
 
             # Enhanced response processing with better error handling
             if hasattr(result, 'success') and not result.success:
@@ -290,17 +368,29 @@ def use_firecrawl_optimized(url: str, extraction_prompt: str = None, css_selecto
                 'summary': f"Firecrawl JSON extraction successful - {len(content)} characters extracted"
             }
         else:
-            # ✅ Standard scraping without extraction using v1 API format
-            logger.info(f"🔥 Calling Firecrawl scrape_url for standard scraping...")
+            # ✅ Standard scraping without extraction
+            logger.info(f"🔥 Calling Firecrawl {scrape_method} for standard scraping...")
             
-            result = app.scrape_url(
-                url=url,
-                formats=["markdown"],
-                only_main_content=True,
-                timeout=SCRAPING_CONFIG.get('firecrawl_timeout', 30) * 1000,  # Convert to milliseconds
-                waitFor=SCRAPING_CONFIG.get('firecrawl_wait_for', 5) * 1000,  # Use configurable wait time in milliseconds
-                skip_tls_verification=True  # Ignorer les problèmes SSL
-            )
+            if scrape_method == 'scrape_url':
+                result = app.scrape_url(
+                    url=url,
+                    formats=["markdown"],
+                    only_main_content=True,
+                    timeout=SCRAPING_CONFIG.get('firecrawl_timeout', 30) * 1000,  # Convert to milliseconds
+                    waitFor=SCRAPING_CONFIG.get('firecrawl_wait_for', 5) * 1000,  # Use configurable wait time in milliseconds
+                    skip_tls_verification=True  # Ignore SSL issues
+                )
+            else:  # scrape method (older API)
+                # The scrape() method takes direct arguments, not a params dict
+                result = app.scrape(
+                    url,
+                    {
+                        "formats": ["markdown"],
+                        "onlyMainContent": True,
+                        "timeout": SCRAPING_CONFIG.get('firecrawl_timeout', 30) * 1000,
+                        "waitFor": SCRAPING_CONFIG.get('firecrawl_wait_for', 5) * 1000
+                    }
+                )
             
             # Process the response
             if hasattr(result, 'success') and not result.success:
@@ -1119,8 +1209,13 @@ def extract_body_content(driver):
         return ""
 
 def extract_articles_selenium(driver):
-    """Extracts articles using Selenium."""
+    """Extracts articles using Selenium with optimized element finding."""
     articles = []
+    
+    # Store original implicit wait and temporarily disable it for faster element searches
+    original_implicit_wait = driver.timeouts.implicit_wait
+    driver.implicitly_wait(0)  # Disable implicit wait to avoid 10s delays
+    
     try:
         # Try different strategies to find articles
         article_elements = (
@@ -1132,17 +1227,24 @@ def extract_articles_selenium(driver):
         for element in article_elements[:10]:  # Limit to 10 articles
             try:
                 if element.tag_name == "article":
-                    link_elem = element.find_element(By.TAG_NAME, "a")
-                    try:
-                        title_elem = element.find_element(By.XPATH, ".//h1 | .//h2 | .//h3")
-                    except:
-                        title_elem = link_elem
+                    # Find link element
+                    link_elems = element.find_elements(By.TAG_NAME, "a")
+                    link_elem = link_elems[0] if link_elems else None
+                    
+                    # Find heading element using find_elements (no implicit wait)
+                    heading_elems = element.find_elements(By.XPATH, ".//h1 | .//h2 | .//h3")
+                    title_elem = heading_elems[0] if heading_elems else link_elem
                 else:
-                    link_elem = element if element.tag_name == "a" else element.find_element(By.TAG_NAME, "a")
-                    try:
-                        title_elem = element.find_element(By.XPATH, ".//h1 | .//h2 | .//h3")
-                    except:
-                        title_elem = link_elem
+                    # For non-article elements
+                    if element.tag_name == "a":
+                        link_elem = element
+                    else:
+                        link_elems = element.find_elements(By.TAG_NAME, "a")
+                        link_elem = link_elems[0] if link_elems else None
+                    
+                    # Find heading element using find_elements (no implicit wait)
+                    heading_elems = element.find_elements(By.XPATH, ".//h1 | .//h2 | .//h3")
+                    title_elem = heading_elems[0] if heading_elems else link_elem
                         
                 href = link_elem.get_attribute("href") if link_elem else None
                 title = title_elem.text if title_elem else None
@@ -1156,6 +1258,9 @@ def extract_articles_selenium(driver):
                 continue  # Skip this article on error
     except Exception as e:
         logger.warning(f"Error extracting articles: {str(e)}")
+    finally:
+        # Restore original implicit wait
+        driver.implicitly_wait(original_implicit_wait)
     
     return articles
 
@@ -1182,33 +1287,37 @@ def extract_css_elements_selenium(driver, css_selector):
     return []
 
 def handle_consent_popups_optimized(driver):
-    """Handles common consent popups more efficiently."""
+    """Handles common consent popups more efficiently with reduced timeouts."""
     try:
-        # Common consent button XPath patterns
+        # Set implicit wait to 0 temporarily to speed up popup detection
+        original_implicit_wait = driver.timeouts.implicit_wait
+        driver.implicitly_wait(0)
+        
+        # Common consent button XPath patterns (reduced to most common)
         consent_patterns = [
             "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept')]",
             "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'agree')]",
-            "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'allow')]",
-            "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'ok')]",
-            "//a[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept')]"
         ]
         
         for xpath in consent_patterns:
             try:
-                # Short timeout for each attempt
-                button = WebDriverWait(driver, 2).until(
+                # Very short timeout - if popup exists it should be immediately visible
+                button = WebDriverWait(driver, 0.5).until(
                     EC.element_to_be_clickable((By.XPATH, xpath))
                 )
                 # Scroll to button and click
                 driver.execute_script("arguments[0].scrollIntoView();", button)
-                time.sleep(0.5)
+                time.sleep(0.2)
                 button.click()
-                logger.info(f"Clicked consent button with XPath: {xpath}")
-                time.sleep(1)  # Wait after click
+                logger.info(f"✓ Clicked consent button with XPath: {xpath}")
+                time.sleep(0.5)  # Brief wait after click
+                driver.implicitly_wait(original_implicit_wait)
                 return True
             except:
                 continue
         
+        driver.implicitly_wait(original_implicit_wait)
+        logger.debug("No consent popups found (this is normal)")
         return False
     except Exception as e:
         logger.warning(f"Error handling consent popups: {str(e)}")
@@ -1223,7 +1332,7 @@ def web_search(query: str = None, messages: list = None, allowed_domains: list =
     Args:
         query (str, optional): The search query. If None, will be generated from messages.
         messages (list, optional): Message history to generate query if needed.
-        allowed_domains (list, optional): List of allowed domains to filter results.
+        allowed_domains (list, optional): List of allowed domains to filter results (IGNORED - too restrictive).
         blocked_domains (list, optional): List of domains to block in results.
         max_results (int, optional): Maximum number of results to return. Default 8.
         
@@ -1236,7 +1345,6 @@ def web_search(query: str = None, messages: list = None, allowed_domains: list =
         # Generate or use provided query
         search_query = query
         if not search_query and messages:
-            # Derive a simple query from the last user message synchronously
             try:
                 last_message = messages[-1]
                 if isinstance(last_message, dict) and "content" in last_message:
@@ -1255,52 +1363,140 @@ def web_search(query: str = None, messages: list = None, allowed_domains: list =
                 "sources": []
             }
         
-        # Build domain filters if needed
-        domain_filters = ""
+        # 🔧 FIX 1: IGNORE allowed_domains (too restrictive)
+        # The agent often chooses domains that block scraping (ESPN, Google News)
         if allowed_domains:
-            domain_filters += " ".join([f"site:{domain}" for domain in allowed_domains])
+            logger.warning(f"⚠️ Ignoring allowed_domains={allowed_domains} (prevents finding results)")
         
+        # Build domain filters ONLY for blocked domains
+        domain_filters = ""
         if blocked_domains:
-            if domain_filters:
-                domain_filters += " "
-            domain_filters += " ".join([f"-site:{domain}" for domain in blocked_domains])
+            domain_filters = " ".join([f"-site:{domain}" for domain in blocked_domains])
         
-        # Combine filters with query
-        full_query = f"{domain_filters} {search_query}".strip()
+        # Combine filters with query (without allowed_domains)
+        full_query = f"{search_query} {domain_filters}".strip()
+        
+        logger.info(f"🔍 Executing search: '{full_query}' (max_results={max_results})")
         
         # Execute web search
         search_results = search_web(full_query, max_results)
         
-        # Extract content from found pages (using existing webscraper function)
+        # Filter out problematic domains that require CAPTCHA (after search)
+        # Also filter non-English sites and low-quality content
+        # Note: Only block domains that consistently return bad content
+        blocked_after_search = [
+            "reddit.com", "twitter.com", "x.com",  # Social media (CAPTCHA)
+            "baidu.com", "zhihu.com", "weibo.com",  # Chinese sites
+            "pinterest.com", "instagram.com", "facebook.com",  # Image/social sites
+            # Removed skyscrapercity.com and skyscraperpage.com - they can have valid data
+            # Removed quora.com - sometimes has good answers
+        ]
+        if search_results:
+            original_count = len(search_results)
+            search_results = [
+                result for result in search_results 
+                if not any(blocked in result.get("link", "") for blocked in blocked_after_search)
+            ]
+            if len(search_results) < original_count:
+                logger.info(f"🚫 Filtered out {original_count - len(search_results)} blocked domains")
+        
+        # Check if search returned any results
+        if not search_results:
+            logger.warning(f"❌ No search results for: '{search_query}'")
+            return {
+                "search_query": search_query,
+                "results": [],
+                "sources": [],
+                "context": "",
+                "error": "No search results found. Try a different query or check your connection.",
+                "instructions": "When answering the question, reference the sources inline by wrapping the index in brackets like this: [1]. If multiple sources are used, reference each without commas like this: [1][2][3]."
+            }
+        
+        logger.info(f"✅ Found {len(search_results)} search results")
+        
+        # 🔧 FIX 2: Scraping optimized with BeautifulSoup first
         scraped_results = []
         sources = []
+        MAX_RELEVANT_PAGES = 2  # Target
+        MAX_ATTEMPTS = 6  # 🔧 Increased to 6 (from 4)
+        attempts_made = 0
         
         for idx, result in enumerate(search_results):
-            if idx < 5:  # Limit number of pages to scrape
-                try:
-                    # Use the optimized webscraper
-                    scraped_data = webscraper(result["link"])
+            # Stop conditions
+            if len(scraped_results) >= MAX_RELEVANT_PAGES:
+                logger.info(f"✅ Reached target of {MAX_RELEVANT_PAGES} relevant pages")
+                break
+            
+            if idx >= MAX_ATTEMPTS:
+                logger.info(f"⚠️ Reached max attempts ({MAX_ATTEMPTS})")
+                break
+            
+            attempts_made = idx + 1
+            
+            try:
+                url = result["link"]
+                title = result.get("title", "No title")
+                
+                logger.info(f"📄 [{idx + 1}/{MAX_ATTEMPTS}] Scraping: {title[:60]}...")
+                
+                # 🔧 FIX 3: Use BeautifulSoup directly (faster)
+                # Instead of "auto" which tries Firecrawl first (30s)
+                scraped_data = webscraper(
+                    url,
+                    prefer_method="beautifulsoup"  # 5-10s instead of 30s+
+                )
+                
+                # Validate scraping succeeded
+                if not scraped_data or not scraped_data.get("full_text"):
+                    logger.warning(f"  ✗ No content extracted")
+                    continue
+                
+                # Extract and validate content
+                content = scraped_data.get("full_text", "")
+                page_title = scraped_data.get("title", title)
+                
+                # 🔧 FIX 4: Strict relevance validation
+                is_relevant, reason = is_content_relevant(content, page_title, search_query)
+                
+                if is_relevant:
+                    scraped_results.append({
+                        "title": page_title,
+                        "content": content,
+                        "url": url
+                    })
                     
-                    # Add to results and sources
-                    if scraped_data and scraped_data.get("full_text"):
-                        scraped_results.append({
-                            "title": scraped_data.get("title", result["title"]),
-                            "content": scraped_data.get("full_text", ""),
-                            "url": result["link"]
-                        })
-                        
-                        sources.append({
-                            "title": scraped_data.get("title", result["title"]),
-                            "url": result["link"],
-                            "snippet": scraped_data.get("full_text", "")[:200] + "..."
-                        })
-                except Exception as e:
-                    logger.warning(f"Failed to scrape {result['link']}: {str(e)}")
+                    sources.append({
+                        "title": page_title,
+                        "url": url,
+                        "snippet": content[:200] + "..."
+                    })
+                    
+                    logger.info(f"  ✅ Valid content: {len(content)} chars")
+                else:
+                    logger.warning(f"  ✗ Rejected: {reason}")
+                    
+            except Exception as e:
+                logger.warning(f"  ✗ Scraping failed: {str(e)[:100]}")
+                continue
+        
+        # 🔧 FIX 5: Check we have at least 1 result
+        if not scraped_results:
+            logger.error(f"❌ No content could be extracted from {attempts_made} attempts")
+            return {
+                "search_query": search_query,
+                "results": [],
+                "sources": [],
+                "context": "",
+                "error": "Found search results but couldn't extract content. Sites may be blocking scraping or require JavaScript.",
+                "instructions": "When answering the question, reference the sources inline by wrapping the index in brackets like this: [1]. If multiple sources are used, reference each without commas like this: [1][2][3]."
+            }
         
         # Build context from scraped results
         context = ""
         for idx, result in enumerate(scraped_results):
             context += f"Source [{idx + 1}]: {result['title']}\n{result['content']}\n\n----------\n\n"
+        
+        logger.info(f"✅ SUCCESS: {len(scraped_results)} pages scraped from {attempts_made} attempts")
         
         return {
             "search_query": search_query,
@@ -1310,7 +1506,7 @@ def web_search(query: str = None, messages: list = None, allowed_domains: list =
             "instructions": "When answering the question, reference the sources inline by wrapping the index in brackets like this: [1]. If multiple sources are used, reference each without commas like this: [1][2][3]."
         }
     except Exception as e:
-        logger.error(f"Web search error: {str(e)}")
+        logger.error(f"❌ Web search error: {str(e)}")
         return {
             "error": str(e),
             "results": [],

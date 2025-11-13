@@ -8,7 +8,12 @@ import uuid
 from huggingsmolagent.agent import app as smolagent_router
 from huggingsmolagent.tools.supabase_store import store_pdf
 from huggingsmolagent.tools.pdf_loader import parse_pdf
-from huggingsmolagent.tools.vector_store import index_documents, retrieve_knowledge
+from huggingsmolagent.tools.vector_store import (
+    index_documents, 
+    retrieve_knowledge, 
+    compute_file_hash, 
+    check_existing_document
+)
 from huggingsmolagent.tools.summarizer import summarize
 from huggingsmolagent.tools.scraper import web_search
 from pydantic import BaseModel
@@ -75,6 +80,29 @@ async def ask(request: Request):
                 print(f"[ask] processing {len(files)} file(s)")
                 for f in files:
                     print(f"[ask] processing file name={getattr(f, 'filename', None)}")
+                    
+                    # Read file content for hashing
+                    file_content = await f.read()
+                    await f.seek(0)  # Reset file pointer for subsequent reads
+                    
+                    # Compute file hash for deduplication
+                    file_hash = compute_file_hash(file_content)
+                    print(f"[ask] computed file_hash={file_hash[:16]}...")
+                    
+                    # Check if this file already exists
+                    existing = check_existing_document(file_hash)
+                    
+                    if existing:
+                        print(f"[ask] ⚠️  File already indexed! doc_id={existing['doc_id']}, chunks={existing['chunk_count']}")
+                        uploaded_context.append({
+                            "filename": f.filename,
+                            "doc_id": existing["doc_id"],
+                            "chunks": existing["chunk_count"],
+                            "reused": True
+                        })
+                        continue
+                    
+                    # New file - proceed with storage and indexing
                     file_url = store_pdf(f)
                     print(f"[ask] stored file_url={file_url}")
                     documents = parse_pdf(f)
@@ -82,15 +110,21 @@ async def ask(request: Request):
                     doc_id = str(uuid.uuid4())
                     stored = index_documents(
                         documents,
-                        base_metadata={"source": file_url, "filename": f.filename, "doc_id": doc_id},
+                        base_metadata={
+                            "source": file_url, 
+                            "filename": f.filename, 
+                            "doc_id": doc_id,
+                            "file_hash": file_hash
+                        },
                     )
                     print(f"[ask] indexed doc_id={doc_id} stored={stored}")
                     uploaded_context.append({
                         "filename": f.filename,
                         "doc_id": doc_id,
-                        "chunks": stored
+                        "chunks": stored,
+                        "reused": False
                     })
-                print(f"[ask] upload complete. {len(uploaded_context)} file(s) indexed")
+                print(f"[ask] upload complete. {len(uploaded_context)} file(s) processed")
         else:
             # JSON body
             body = await request.json() if is_json else {}
@@ -100,22 +134,88 @@ async def ask(request: Request):
         if not query:
             return JSONResponse({"answer": "Please provide a query."}, status_code=400)
 
-        # STEP 2: Delegate all reasoning to smolagent
+        # STEP 2: Delegate to smolagent with HYBRID approach
         print(f"[ask] delegating to smolagent with query='{query[:100]}'")
         print(f"[ask] uploaded_files_context={len(uploaded_context)} files")
         
-        # Build context message for smolagent
+        # Build enhanced context message for smolagent
         context_msg = ""
-        if uploaded_context:
-            filenames = [ctx["filename"] for ctx in uploaded_context]
-            context_msg = f"\n[Context: User just uploaded {len(uploaded_context)} file(s): {', '.join(filenames)}]"
         
-        # Call smolagent via internal HTTP (you could also import and call directly)
-        # For now, we'll use a simple approach: import the agent and call it
+        if uploaded_context:
+            # HYBRID APPROACH: Pre-fetch a preview to guide the agent
+            # This helps the agent understand that content is available in the vector store
+            print("[ask] HYBRID: Pre-fetching document preview to guide agent")
+            
+            try:
+                # Get a small preview (3 chunks) to show the agent what's available
+                preview_result = retrieve_knowledge(
+                    query="document overview summary",
+                    top_k=3  # Just a preview, not the full content
+                )
+                
+                # Extract preview text (limit to 400 chars to keep prompt manageable)
+                preview_text = preview_result.get('context', '')[:400]
+                has_preview = bool(preview_text.strip())
+                
+                if has_preview:
+                    print(f"[ask] HYBRID: Preview retrieved ({len(preview_text)} chars)")
+                else:
+                    print("[ask] HYBRID: No preview content found")
+                
+            except Exception as preview_error:
+                print(f"[ask] HYBRID: Preview fetch failed: {preview_error}")
+                has_preview = False
+                preview_text = ""
+            
+            # Build the context message with explicit instructions for the agent
+            filenames = [ctx["filename"] for ctx in uploaded_context]
+            doc_ids = [ctx["doc_id"] for ctx in uploaded_context]
+            total_chunks = sum(ctx["chunks"] for ctx in uploaded_context)
+            
+            # For single file upload, provide the doc_id
+            doc_id_instruction = ""
+            if len(doc_ids) == 1:
+                doc_id_instruction = f'\nIMPORTANT: Use doc_id="{doc_ids[0]}" parameter to retrieve THIS specific document!'
+            
+            context_msg = f"""
+[Context: User just uploaded {len(uploaded_context)} file(s): {', '.join(filenames)}]
+[Total chunks indexed: {total_chunks}]{doc_id_instruction}
+
+IMPORTANT INSTRUCTIONS FOR YOU (the agent):
+1. The uploaded file(s) have been ALREADY indexed in the Supabase vector database
+2. You MUST use the retrieve_knowledge() tool to access the document content
+3. DO NOT try to use pdf_reader, file_reader, or any file I/O operations - they don't exist
+4. The retrieve_knowledge() tool will return the document chunks with similarity scores
+
+Example usage for THIS uploaded document:
+<code>
+result = retrieve_knowledge(query="document summary", top_k=20{f', doc_id="{doc_ids[0]}"' if len(doc_ids) == 1 else ''})
+print(f"Retrieved {{len(result['results'])}} chunks")
+print(result['context'][:500])  # Preview the content
+</code>
+"""
+            
+            # Add preview if available to show the agent there's real content
+            if has_preview:
+                context_msg += f"""
+Document preview (first 400 chars from vector store):
+---
+{preview_text}...
+---
+
+Use retrieve_knowledge(query="...", top_k=20) to get the full document content.
+"""
+            else:
+                context_msg += """
+Note: Preview unavailable, but content is indexed. Use retrieve_knowledge() to access it.
+"""
+        
+        # Call smolagent with the enhanced query
         from huggingsmolagent.agent import run_agent_sync
         
         agent_query = query + context_msg if context_msg else query
-        print(f"[ask] calling agent with: '{agent_query[:150]}'")
+        print(f"[ask] calling agent with enhanced query (length={len(agent_query)})")
+        print(f"[ask] query preview: '{agent_query[:200]}...'")
         
         result = run_agent_sync(agent_query)
         print(f"[ask] smolagent response received length={len(str(result)) if result else 0}")
@@ -137,6 +237,28 @@ async def upload_pdf(file: UploadFile = File(...)):
     print("[upload] /upload called")
     print ("filename", file.filename, "content_type" ,file.content_type)
 
+    # Read file content for hashing
+    file_content = await file.read()
+    await file.seek(0)  # Reset file pointer for subsequent reads
+    
+    # Compute file hash for deduplication
+    file_hash = compute_file_hash(file_content)
+    print(f"[upload] computed file_hash={file_hash[:16]}...")
+    
+    # Check if this file already exists
+    existing = check_existing_document(file_hash)
+    
+    if existing:
+        print(f"[upload] ⚠️  File already indexed! doc_id={existing['doc_id']}, chunks={existing['chunk_count']}")
+        return {
+            "file_url": existing.get("source", ""),
+            "doc_id": existing["doc_id"],
+            "chunks_indexed": existing["chunk_count"],
+            "summary": f"File '{file.filename}' was already indexed. Reusing existing document.",
+            "reused": True
+        }
+
+    # New file - proceed with storage and indexing
     # 1. Save in supabase storage
     file_url = store_pdf(file)
     print("[upload] stored file_url", file_url)
@@ -153,7 +275,12 @@ async def upload_pdf(file: UploadFile = File(...)):
     print("[upload] doc_id", doc_id)
     stored = index_documents(
         documents,
-        base_metadata={"source": file_url, "filename": file.filename, "doc_id": doc_id},
+        base_metadata={
+            "source": file_url, 
+            "filename": file.filename, 
+            "doc_id": doc_id,
+            "file_hash": file_hash
+        },
     )
     print("[upload] indexed stored=", stored)
     

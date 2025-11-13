@@ -1,12 +1,12 @@
 import os
 from typing import List
 from dotenv import load_dotenv
-from langchain.chains.summarize import load_summarize_chain
+from langchain_classic.chains.summarize import load_summarize_chain
 from langchain_core.documents import Document
 from langchain_openai import ChatOpenAI
 from langchain_ollama import ChatOllama
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.prompts import PromptTemplate
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_classic.prompts import PromptTemplate
 
 load_dotenv() 
 

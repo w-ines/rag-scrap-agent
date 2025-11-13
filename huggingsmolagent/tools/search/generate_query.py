@@ -16,11 +16,11 @@ async def generate_query(messages: List[Dict[str, Any]], llm_model=None) -> str:
     Returns:
         Requête de recherche générée
     """
-    # Si aucun message, retourne une chaîne vide
+    # If no messages, return empty string
     if not messages:
         return ""
     
-    # Extrait le dernier message (supposé être la requête de l'utilisateur)
+    # Extract the last message (assumed to be the user's query)
     last_message = messages[-1]
     
     if isinstance(last_message, dict) and "content" in last_message:
@@ -30,11 +30,11 @@ async def generate_query(messages: List[Dict[str, Any]], llm_model=None) -> str:
     else:
         content = str(last_message)
     
-    # Option simple: utiliser directement le dernier message comme requête
+    # Simple option: use the last message directly as query
     if not llm_model:
         return content
     
-    # Option avancée: utiliser un LLM pour générer une meilleure requête
+    # Advanced option: use an LLM to generate a better query
     try:
         prompt = f"""
         Based on the conversation history, generate a search query that would help find relevant information to answer the user's request. 
