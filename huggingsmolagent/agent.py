@@ -12,7 +12,7 @@ try:
 except Exception:
     streaming_manager = None
 # from huggingsmolagent.tools.retrieval_tool import RetrieverTool
-from huggingsmolagent.tools.scraper import webscraper, web_search
+from huggingsmolagent.tools.scraper import webscraper, web_search, visit_webpage
 from huggingsmolagent.tools.vector_store import retrieve_knowledge
 from huggingsmolagent.tools.weather import get_weather, get_weather_simple
 import os.path
@@ -81,14 +81,26 @@ def extract_final_answer(llm_response: str) -> str:
         answer = match.group(1).strip()
         return format_json_response(answer)
         
-    # Fallback: return the last non-empty line
+    # Fallback: return all content (not just last line) for multi-line responses
     lines = [line for line in llm_response.strip().split("\n") if line.strip()]
     if lines:
-        # Try to avoid returning object representations
-        for line in reversed(lines):
-            if not line.startswith(("ActionStep(", "MessageRole.", "<")):
-                cleaned_line = line.strip()
-                return format_json_response(cleaned_line)
+        # Filter out object representations and internal markers
+        clean_lines = []
+        for line in lines:
+            stripped = line.strip()
+            # Skip internal framework output
+            if stripped.startswith(("ActionStep(", "MessageRole.", "<", "Calling tools:", "Execution logs:")):
+                continue
+            # Skip lines that look like code execution markers
+            if stripped.startswith(("Out:", "In:", ">>>")):
+                continue
+            clean_lines.append(stripped)
+        
+        if clean_lines:
+            # Return ALL clean lines joined, not just the last one
+            result = "\n".join(clean_lines)
+            return format_json_response(result)
+    
     return "Unable to extract final answer"
 
 def format_json_response(response: str) -> str:
@@ -514,28 +526,96 @@ def format_step(step: str) -> str:
     return f"📝 **Step:** {step_str}"
 
 class StepTracker:
+    """
+    Tracks and formats ReAct agent steps for user-friendly display.
+    ReAct Pattern: Thought → Action → Observation → ... → Final Answer
+    """
     def __init__(self):
         self.steps = []
-        self.current_thought = ""
-        self.current_code = ""
-        self.current_observation = ""
+        self.iteration = 0
         
     def __call__(self, step: str):
-        """This method is called by the agent at each step"""
-        print(f"🔍 StepTracker called with: {step}")
-        formatted_step = self.format_step_realtime(step)
-        if formatted_step:
-            self.steps.append(formatted_step)
-            print(f"🔍 Step added: {formatted_step}")
+        """Called by the agent at each step"""
+        formatted_steps = self.format_step_realtime(step)
+        for step in formatted_steps:
+            if step:
+                self.steps.append(step)
+    
+    def _get_action_description(self, code: str) -> tuple[str, str]:
+        """
+        Convert code to human-readable action description.
+        Returns (emoji, description)
+        """
+        code_lower = code.lower()
+        
+        if 'final_answer' in code_lower:
+            return "✅", "Generating final answer..."
+        elif 'get_weather' in code_lower:
+            # Extract location if possible
+            loc_match = re.search(r'location=["\']([^"\']+)["\']', code)
+            loc = loc_match.group(1) if loc_match else "requested location"
+            return "🌤️", f"Fetching weather for {loc}..."
+        elif 'web_search' in code_lower:
+            # Extract query if possible
+            query_match = re.search(r'query=["\']([^"\']+)["\']', code)
+            query = query_match.group(1)[:50] if query_match else "your question"
+            return "🔎", f"Searching the web for: \"{query}\"..."
+        elif 'webscraper' in code_lower:
+            url_match = re.search(r'url=["\']([^"\']+)["\']', code)
+            url = url_match.group(1)[:40] + "..." if url_match else "webpage"
+            return "🌐", f"Scraping content from {url}"
+        elif 'visit_webpage' in code_lower:
+            return "🌐", "Visiting webpage to extract content..."
+        elif 'retrieve_knowledge' in code_lower:
+            query_match = re.search(r'query=["\']([^"\']+)["\']', code)
+            query = query_match.group(1)[:40] if query_match else "your question"
+            return "📚", f"Searching knowledge base for: \"{query}\"..."
+        elif 'print(' in code_lower:
+            return "", ""  # Skip print statements
+        else:
+            # Show short code snippet for transparency
+            if len(code) < 80:
+                return "⚙️", f"Executing: `{code.strip()}`"
+            return "⚙️", "Executing code..."
+    
+    def _format_observation(self, observation: str) -> str:
+        """Format observation result for user display"""
+        observation = re.sub(r'\s+', ' ', observation).strip()
+        
+        # Weather results
+        if 'temperature' in observation.lower() or 'weather' in observation.lower():
+            return observation[:200] if len(observation) > 200 else observation
+        
+        # Retrieved chunks
+        if 'retrieved' in observation.lower() and 'chunk' in observation.lower():
+            chunk_match = re.search(r'(\d+)\s*chunk', observation.lower())
+            if chunk_match:
+                return f"Found {chunk_match.group(1)} relevant document sections"
+            return "Retrieved relevant document sections"
+        
+        # Web content
+        if 'webpage' in observation.lower() or 'html' in observation.lower() or len(observation) > 300:
+            return "Content retrieved successfully"
+        
+        # Error
+        if 'error' in observation.lower() or 'failed' in observation.lower():
+            return observation[:150] + "..." if len(observation) > 150 else observation
+        
+        # Default: truncate if too long
+        if len(observation) > 150:
+            return observation[:150] + "..."
+        return observation
             
     def format_step_realtime(self, step_content) -> List[str]:
-        """Format steps in real-time for readable display, returning multiple formatted steps"""
+        """
+        Format steps following ReAct pattern for clear user display.
+        Returns list of formatted step strings.
+        """
         if not step_content:
             return []
         
-        # Convert to string if it's an ActionStep object or other complex type
+        # Convert to string
         if hasattr(step_content, 'model_output'):
-            # Extract the actual LLM output from ActionStep object
             step_str = step_content.model_output
         elif hasattr(step_content, 'content'):
             step_str = step_content.content
@@ -544,94 +624,53 @@ class StepTracker:
         
         if not isinstance(step_str, str):
             step_str = str(step_str)
-            
-        print(f"🔍 Processing step_str: {step_str[:200]}...")
         
         formatted_steps = []
         
-        # Extract Thought
+        # === THOUGHT (Reasoning) ===
         if "Thought:" in step_str:
             thought_match = re.search(r"Thought:\s*(.+?)(?=\nCode:|\n\nCode:|\nAction:|\nObservation:|$)", step_str, re.DOTALL)
             if thought_match:
-                thought = thought_match.group(1).strip()
-                # Clean up thought text
-                thought = re.sub(r'\s+', ' ', thought)
+                thought = re.sub(r'\s+', ' ', thought_match.group(1).strip())
+                # Clean up thought - remove technical jargon
+                thought = thought.replace("I need to", "I'll")
+                thought = thought.replace("I will", "I'll")
+                if len(thought) > 200:
+                    thought = thought[:200] + "..."
                 formatted_steps.append(f"💭 **Thought:** {thought}")
         
-        # Extract Code (simplified - only show short code or action summary)
+        # === ACTION (Tool execution) ===
         if "Code:" in step_str:
-            # Instead of showing full code, show a summary of what's being executed
             code_match = re.search(r"Code:\s*```(?:python|py)?\s*(.*?)```", step_str, re.DOTALL)
             if code_match:
                 code = code_match.group(1).strip()
-                # Only show code if it's short and meaningful
-                if len(code) < 150 and not any(keyword in code.lower() for keyword in ['visit_webpage', 'webscraper', 'print(']):
-                    formatted_steps.append(f"💻 **Code Execution:**\n```python\n{code}\n```")
-                else:
-                    # Show a summary instead of full code
-                    if 'visit_webpage' in code:
-                        formatted_steps.append(f"🌐 **Action:** Visiting webpage...")
-                    elif 'webscraper' in code:
-                        formatted_steps.append(f"🔍 **Action:** Scraping webpage content...")
-                    elif 'get_weather' in code:
-                        formatted_steps.append(f"🌤️ **Action:** Getting weather information...")
-                    elif 'web_search' in code:
-                        formatted_steps.append(f"🔎 **Action:** Searching the web...")
-                    elif 'final_answer' in code:
-                        formatted_steps.append(f"✅ **Action:** Generating final response...")
-                    else:
-                        formatted_steps.append(f"⚙️ **Action:** Executing code...")
+                emoji, action_desc = self._get_action_description(code)
+                if action_desc:  # Skip if empty (e.g., print statements)
+                    formatted_steps.append(f"{emoji} **Action:** {action_desc}")
         
-        # Extract Action
-        if "Action:" in step_str:
-            action_match = re.search(r"Action:\s*(.+?)(?=\nThought:|\nCode:|\nObservation:|$)", step_str, re.DOTALL)
-            if action_match:
-                action = action_match.group(1).strip()
-                # Simplify action display
-                if len(action) > 200:
-                    action = action[:200] + "..."
-                formatted_steps.append(f"⚡ **Action:** {action}")
-        
-        # Extract Observation
+        # === OBSERVATION (Result) ===
         if "Observation:" in step_str:
             obs_match = re.search(r"Observation:\s*(.+?)(?=\nThought:|\nCode:|\nAction:|$)", step_str, re.DOTALL)
             if obs_match:
                 observation = obs_match.group(1).strip()
-                # Clean observation and limit length significantly
-                observation = re.sub(r'\s+', ' ', observation)
-                
-                # For webpage content, show only summary
-                if len(observation) > 150:
-                    # Try to extract meaningful summary
-                    if 'webpage' in observation.lower() or 'html' in observation.lower():
-                        formatted_steps.append(f"👁️ **Observation:** Webpage content retrieved successfully")
-                    elif 'error' in observation.lower():
-                        # Show errors in full but limit length
-                        observation = observation[:200] + "..." if len(observation) > 200 else observation
-                        formatted_steps.append(f"❌ **Observation:** {observation}")
-                    else:
-                        # General case - show first part
-                        observation = observation[:150] + "..."
-                        formatted_steps.append(f"👁️ **Observation:** {observation}")
+                formatted_obs = self._format_observation(observation)
+                if 'error' in formatted_obs.lower():
+                    formatted_steps.append(f"❌ **Result:** {formatted_obs}")
                 else:
-                    formatted_steps.append(f"👁️ **Observation:** {observation}")
+                    formatted_steps.append(f"👁️ **Observation:** {formatted_obs}")
         
-        # Check for execution results (lines starting with special markers)
-        execution_lines = []
+        # === FINAL ANSWER detection ===
+        if "final_answer" in step_str.lower():
+            if not any("final answer" in s.lower() for s in formatted_steps):
+                formatted_steps.append("✅ **Generating final answer...**")
+        
+        # === Output lines (execution results) ===
         for line in step_str.split('\n'):
             line = line.strip()
-            if line.startswith('─ Executing parsed code:') or line.startswith('Out - '):
-                if 'Final answer:' in line:
-                    formatted_steps.append("✅ **Generating final response...**")
-                elif line.startswith('Out - '):
-                    result = line.replace('Out - ', '').strip()
-                    if result and not result.startswith('Final answer:'):
-                        formatted_steps.append(f"📤 **Output:** {result}")
-        
-        # Check for final answer generation
-        if "final_answer" in step_str and ("Final Answer:" in step_str or "final_answer(" in step_str):
-            if not any("Generating final response" in step for step in formatted_steps):
-                formatted_steps.append("✅ **Generating final response...**")
+            if line.startswith('Out - ') and 'Final answer' not in line:
+                result = line.replace('Out - ', '').strip()
+                if result and len(result) < 200:
+                    formatted_steps.append(f"📤 **Output:** {result}")
         
         return formatted_steps
             
@@ -648,27 +687,32 @@ async def generate_streaming_response(request_data: ComplexRequest):
     step_queue = queue.Queue()
     agent_finished = threading.Event()
     
-    # Create step tracker with queue communication
+    # Create step tracker with queue communication and deduplication
     class QueueStepTracker(StepTracker):
         def __init__(self, step_queue):
             super().__init__()
             self.step_queue = step_queue
             self.step_counter = 0
+            self.sent_steps = set()  # Track sent steps to avoid duplicates
             
         def __call__(self, step):
             """This method is called by the agent at each step"""
-            print(f"🔍 QueueStepTracker called with: {step}")
             formatted_steps = self.format_step_realtime(step)
             
             for formatted_step in formatted_steps:
                 if formatted_step:
+                    # Skip duplicate steps (compare normalized version)
+                    step_key = formatted_step.strip().lower()
+                    if step_key in self.sent_steps:
+                        continue
+                    self.sent_steps.add(step_key)
+                    
                     self.steps.append(formatted_step)
                     self.step_counter += 1
-                    print(f"🔍 Step {self.step_counter} added: {formatted_step}")
+                    print(f"� Step {self.step_counter}: {formatted_step[:80]}...")
                     
                     # Send to queue immediately
                     self.step_queue.put(formatted_step)
-                    print(f"🔍 Step {self.step_counter} sent to queue")
     
     step_tracker = QueueStepTracker(step_queue)
     
@@ -734,7 +778,7 @@ async def generate_streaming_response(request_data: ComplexRequest):
 
         # Intent classification to hint tool choice
         def classify_query_intent(user_query: str, selected_tools: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-            intent = "rag"
+            intent = "scrape"  # Default to scrape (web search) instead of rag
             reason = []
             detected_url = None
             q = (user_query or "").lower()
@@ -743,8 +787,20 @@ async def generate_streaming_response(request_data: ComplexRequest):
                 detected_url = m.group(0)
                 intent = "scrape"
                 reason.append("url detected")
+            
+            # Weather keywords - should use get_weather_simple(), NOT web_search
+            weather_keywords = [
+                "weather", "temperature", "forecast", "how is it in", "what's the weather",
+                "how's the weather", "is it raining", "is it sunny", "is it cold", "is it hot"
+            ]
+            if any(k in q for k in weather_keywords):
+                intent = "weather"
+                reason.append("weather keywords")
+                return {"intent": intent, "url": detected_url, "reason": ", ".join(reason) or "heuristics"}
+            
             scrape_keywords = [
                 "scrape", "crawl", "website", "webpage", "from site", "from web", "google", "search the web",
+                "news", "current", "today", "latest"  # Removed "weather" - handled separately
             ]
             if any(k in q for k in scrape_keywords):
                 intent = "scrape"
@@ -766,10 +822,56 @@ async def generate_streaming_response(request_data: ComplexRequest):
             return {"intent": intent, "url": detected_url, "reason": ", ".join(reason) or "heuristics"}
 
         intent_info = classify_query_intent(query, getattr(request_data, "selectedTools", None))
+        
+        # EARLY RETURN: If weather intent but no city specified, ask user to specify
+        if intent_info['intent'] == "weather":
+            # Check if query contains a recognizable city/location
+            q_lower = query.lower()
+            # Common patterns that indicate a city IS specified
+            city_patterns = [
+                r'\bin\s+\w+',  # "in London", "in Paris"
+                r'\bfor\s+\w+',  # "for Tokyo"
+                r'\bat\s+\w+',  # "at New York"
+            ]
+            # List of common cities to check
+            common_cities = [
+                "london", "paris", "tokyo", "new york", "berlin", "madrid", "rome",
+                "amsterdam", "barcelona", "moscow", "sydney", "melbourne", "toronto",
+                "vancouver", "chicago", "los angeles", "san francisco", "seattle",
+                "boston", "miami", "dubai", "singapore", "hong kong", "beijing",
+                "shanghai", "mumbai", "delhi", "cairo", "lagos", "nairobi"
+            ]
+            
+            has_city = any(city in q_lower for city in common_cities)
+            has_pattern = any(re.search(p, q_lower) for p in city_patterns)
+            
+            if not has_city and not has_pattern:
+                # No city detected - return early asking user to specify
+                logger.info("Weather query without city detected - asking user to specify location")
+                no_city_response = {
+                    "type": "final",
+                    "answer": "I'd be happy to help with weather information! 🌤️\n\nPlease specify a city or location, for example:\n- \"Weather in Paris\"\n- \"How is it in London?\"\n- \"Temperature in Tokyo\"",
+                    "steps": [{
+                        "type": "step",
+                        "emoji": "🌤️",
+                        "description": "Weather query detected but no city specified"
+                    }]
+                }
+                yield f"data: {json.dumps(no_city_response)}\n\n"
+                return
+        
+        # Generate intent hint based on detected intent type
+        if intent_info['intent'] == "weather":
+            intent_hint_tools = "Preferred tool: get_weather_simple(location). DO NOT use web_search for weather!"
+        elif intent_info['intent'] == "rag":
+            intent_hint_tools = "Preferred tools: retrieve_knowledge (RAG)."
+        else:
+            intent_hint_tools = "Preferred tools: web_search then webscraper (web)."
+        
         intent_hint = (
             f"Detected intent: {intent_info['intent']}. "
             + (f"URL: {intent_info['url']}. " if intent_info.get("url") else "")
-            + ("Preferred tools: retrieve_knowledge (RAG). " if intent_info['intent'] == "rag" else "Preferred tools: web_search then webscraper (web). ")
+            + intent_hint_tools + " "
             + f"Reason: {intent_info['reason']}."
         )
 
@@ -790,8 +892,9 @@ async def generate_streaming_response(request_data: ComplexRequest):
         logger.debug("Initializing OpenAIServerModel")
 
         # Configure the language model (Ollama/OpenAI-compatible server)
+        # Using llama3.2:latest (3.2B) for much faster responses
         llm_model = OpenAIServerModel(
-            model_id=os.getenv("OLLAMA_CHAT_MODEL", "qwen2.5:7b-instruct"),
+            model_id=os.getenv("OLLAMA_CHAT_MODEL", "llama3.2:latest"),
             api_base=os.getenv("BASE_URL", "http://localhost:11434/v1"),
             api_key="ollama"  # Ollama doesn't need real API key
         )
@@ -819,58 +922,148 @@ async def generate_streaming_response(request_data: ComplexRequest):
 
 IMPORTANT: You MUST respond in English only. Never use Chinese or any other language in your responses.
 
+⚡ EFFICIENCY RULES - MINIMIZE STEPS:
+====================================
+
+🎯 YOUR GOAL: Answer in 1-2 steps maximum. DO NOT overthink.
+
+CRITICAL WORKFLOW - CHOOSE THE RIGHT TOOL:
+==========================================
+1. 🌤️ Weather questions → get_weather_simple(location)
+2. 📄 Document-only questions → retrieve_knowledge()
+3. 🌐 Web search needed → web_search() or webscraper()
+4. 📄+🌐 Document + Web → BOTH retrieve_knowledge() AND web_search()
+5. ⚡ Always verify results before calling final_answer()
+
+🌤️ WEATHER QUERIES - CRITICAL:
+===============================
+For ANY weather question, use get_weather_simple(location="CITY_NAME")
+
+Example - "how is it in london" or "weather in Paris":
+<code>
+weather = get_weather_simple(location="London")
+final_answer(weather)
+</code>
+
+⚠️ IMPORTANT: The parameter is 'location', NOT 'query'!
+✅ CORRECT: get_weather_simple(location="London")
+❌ WRONG: get_weather_simple(query="London weather")
+❌ WRONG: web_search(query="London weather") for simple weather questions
+
+🚨 IF NO CITY SPECIFIED:
+========================
+If the user asks about weather WITHOUT mentioning a city (e.g., "what's the weather?", "is it raining?"):
+<code>
+final_answer("I'd be happy to help with weather information! Please specify a city or location (e.g., 'weather in Paris' or 'how is it in London').")
+</code>
+DO NOT guess a city. DO NOT use a default. ASK the user to specify.
+
+
+📄 DOCUMENT QUERIES:
+===================
+For questions about uploaded documents:
+✅ Use retrieve_knowledge() to get document content
+✅ You CAN combine with web_search() if the question requires external info
+✅ Example: "Compare this document with current market trends"
+   → retrieve_knowledge() for document + web_search() for trends
+
+⚡ VERIFICATION BEFORE final_answer():
+=====================================
+Before calling final_answer(), CHECK:
+1. Did I get the information needed?
+2. Is the result complete and accurate?
+3. Should I retrieve more data or search further?
+
+✅ GOOD - Verify then answer:
+Code:
+result = retrieve_knowledge(query="main topic", top_k=10)
+if len(result['results']) < 3:
+    # Not enough info, search more
+    web_info = web_search(query="additional context")
+    final_answer(f"Based on document and web: {result['context']} {web_info}")
+else:
+    final_answer(f"Based on document: {result['context']}")
+
+❌ BAD - Answer without verification:
+Code:
+result = retrieve_knowledge(query="topic", top_k=10)
+final_answer(result['context'])  # No check if result is good!
+
+❌ WRONG (4 steps):
+Thought: User wants summary
+Thought: I should check what tools I have
+Thought: I will use retrieve_knowledge
+Code: retrieve_knowledge(...)
+Thought: Now I have the content
+Code: final_answer(...)
+
+✅ CORRECT (2 steps):
+Thought: User uploaded file, retrieving content
+Code: retrieve_knowledge(query="document summary", top_k=20)
+Thought: Synthesizing answer from retrieved chunks
+Code: final_answer("Based on the document [1][2][3]...")
+
 CRITICAL RULES FOR DOCUMENT HANDLING:
 =====================================
 
 When you see context indicating files were uploaded (e.g., "[Context: User just uploaded X file(s): filename.pdf]"):
 
-1. ✅ The files are ALREADY indexed in the Supabase vector database
-2. ✅ You MUST use retrieve_knowledge() to access document content
-3. ❌ DO NOT try to use: pdf_reader(), file_reader(), open(), or any file I/O
-4. ❌ These file operations DO NOT EXIST and will fail
+1. ✅ Files are ALREADY indexed in Supabase vector database
+2. ✅ IMMEDIATELY use retrieve_knowledge() - this is your PRIMARY tool
+3. ❌ DO NOT use: pdf_reader(), file_reader(), open(), or any file I/O
+4. ❌ DO NOT call web_search for document questions
+5. ⚡ Act decisively - minimize thinking steps
 
-Correct workflow for document tasks:
------------------------------------
-Task: "summarize this document [Context: User just uploaded file.pdf]"
-
-Step 1 - Retrieve content:
-{{code_block_opening_tag}}
-result = retrieve_knowledge(query="document summary", top_k=20)
-print(f"Retrieved {len(result['results'])} chunks")
-print(result['context'][:1000])  # Preview content
-{{code_block_closing_tag}}
-
-Step 2 - Analyze and synthesize:
-{{code_block_opening_tag}}
-# Use the retrieved context to create summary
-# The result['context'] contains all document text with sources
-summary = "Based on the document [1][2][3]..."
-final_answer(summary)
-{{code_block_closing_tag}}
-
-Remember: retrieve_knowledge() returns a dict with:
-- results: list of dicts, each with keys: 'content' (text), 'metadata' (dict), 'score' (float)
-- sources: list of source references for citations
+Quick Reference - retrieve_knowledge():
+--------------------------------------
+retrieve_knowledge() returns a dict with:
+- results: list of dicts with 'content' (text), 'metadata', 'score'
 - context: formatted text ready for analysis (USE THIS DIRECTLY!)
+- sources: list of source references for citations
 - instructions: how to cite sources
 
-IMPORTANT: Each chunk in results has a 'content' key, NOT 'text'!
-Example: chunk['content'] ✅  chunk['text'] ❌
+IMPORTANT: Use chunk['content'] not chunk['text']
+BEST PRACTICE: Use result['context'] directly, cite with [1], [2], etc.
 
-BEST PRACTICE: Use result['context'] directly instead of manually iterating chunks!
-Always cite sources using [1], [2], etc. as shown in the instructions field.
+EXAMPLE - Complete workflow:
+{{code_block_opening_tag}}
+result = retrieve_knowledge(query="main topics", top_k=15)
+final_answer(f"Summary: {result['context'][:500]}... [1][2][3]")
+{{code_block_closing_tag}}
+
+⚡ REMEMBER: Speed matters. Answer quickly and accurately.
 """
         
+        # Build tools list - only include retrieve_knowledge if RAG tool is selected or doc_id is present
+        # Note: visit_webpage is our custom version with content truncation (max 3000 chars)
+        # to prevent LLM context overflow from huge web pages
+        tools_list = [
+            get_weather_simple,
+            web_search,
+            webscraper,
+            visit_webpage,  # Custom tool with truncation - overrides default
+        ]
+        
+        # Check if RAG/document retrieval is needed
+        has_rag_tool = False
+        if request_data.selectedTools:
+            for tool in request_data.selectedTools:
+                if tool.get("name") == "rag" or "rag" in str(tool).lower():
+                    has_rag_tool = True
+                    break
+        
+        # Also check if there's a doc_id in the query context (from uploaded files)
+        if has_rag_tool or "doc_id" in query.lower() or "[context: user just uploaded" in query.lower():
+            tools_list.append(retrieve_knowledge)
+            logger.info("✅ retrieve_knowledge tool added (RAG mode active)")
+        else:
+            logger.info("ℹ️ retrieve_knowledge tool NOT added (no files uploaded)")
+        
         agent = CodeAgent(
-            tools=[
-                get_weather_simple,
-                web_search,
-                webscraper,
-                retrieve_knowledge,
-            ],
+            tools=tools_list,
             model=llm_model,
             add_base_tools=True,
-            max_steps=8,
+            max_steps=8,  
             verbosity_level=2,  # Ensures thoughts/actions are in the output string
             step_callbacks=[step_tracker],
             instructions=custom_rag_instructions,  # Use instructions parameter (not custom_instructions)
@@ -899,12 +1092,23 @@ Always cite sources using [1], [2], etc. as shown in the instructions field.
         agent_result = None
         agent_error = None
         agent_start_time = time.time()
-        AGENT_TIMEOUT = 300  # 5 minutes - reasonable timeout for most queries
+        # Allow configurable timeout via environment variable, default to 2 minutes
+        AGENT_TIMEOUT = int(os.getenv("AGENT_TIMEOUT_SECONDS", "600"))  # ⭐ OPTIMIZED: 2 minutes default (was 10 minutes)
+        logger.info(f"Agent timeout set to {AGENT_TIMEOUT}s")
+        
+     
+        # Send initial message
+        initial_data = {
+            "steps": ["🚀 **Starting ReAct Agent...** Analyzing your question"],
+            "response": None
+        }
+        yield f"data: {json.dumps(initial_data, ensure_ascii=False)}\n\n"
         
         def run_agent():
             nonlocal agent_result, agent_error
             try:
                 logger.info("Running agent with query")
+                # No more generic "Initializing" message - let actual steps speak
                 agent_result = agent.run(enhanced_query)
                 agent_finished.set()  # Signal completion
                 print("🔍 Agent execution completed")
@@ -912,20 +1116,46 @@ Always cite sources using [1], [2], etc. as shown in the instructions field.
                 agent_error = e
                 agent_finished.set()  # Signal completion even on error
                 print(f"🔍 Agent execution failed: {e}")
-        
         # Start agent in background thread
         agent_thread = threading.Thread(target=run_agent)
         agent_thread.start()
         
         # Stream steps as they come from the queue
+        last_progress_log = time.time()
+        last_heartbeat = time.time()
+        heartbeat_interval = 45  # ⭐ OPTIMIZED: Send heartbeat only every 45s to reduce noise
+        sent_heartbeat_once = False  # Only send ONE heartbeat message to avoid spam
+        
         while not agent_finished.is_set() or not step_queue.empty():
             # Check for timeout
             elapsed = time.time() - agent_start_time
+            
+            # Log progress every 30 seconds
+            if elapsed - (last_progress_log - agent_start_time) >= 30:
+                logger.info(f"⏱️ Agent still running... {elapsed:.1f}s elapsed (timeout: {AGENT_TIMEOUT}s)")
+                last_progress_log = time.time()
+            
             if elapsed > AGENT_TIMEOUT:
                 logger.error(f"⏱️ Agent timeout after {elapsed:.1f}s (limit: {AGENT_TIMEOUT}s)")
                 agent_error = TimeoutError(f"Agent execution exceeded {AGENT_TIMEOUT}s timeout")
                 agent_finished.set()
                 break
+            
+            # Send ONE heartbeat if no activity for a while (avoid spam)
+            time_since_last_heartbeat = time.time() - last_heartbeat
+            if time_since_last_heartbeat >= heartbeat_interval and not agent_finished.is_set() and not sent_heartbeat_once:
+                # Send only ONE progress message to show the agent is still working
+                progress_msg = "⏳ **Still working...** The agent is processing your request"
+                sent_heartbeat_once = True  # Only send once
+                
+                progress_data = {
+                    "steps": [progress_msg],
+                    "response": None
+                }
+                json_str = json.dumps(progress_data, ensure_ascii=False)
+                yield f"data: {json_str}\n\n"
+                print(f"💓 Sent single heartbeat to frontend")
+                last_heartbeat = time.time()
             
             try:
                 # Try to get step from queue with timeout
@@ -939,6 +1169,9 @@ Always cite sources using [1], [2], etc. as shown in the instructions field.
                 json_str = json.dumps(steps_data, ensure_ascii=False)
                 yield f"data: {json_str}\n\n"
                 print(f"🔍 Streamed step to frontend: {step[:50]}...")
+                
+                # Reset heartbeat timer when we send a real step
+                last_heartbeat = time.time()
                 
             except queue.Empty:
                 # No step available, continue waiting
@@ -958,7 +1191,7 @@ Always cite sources using [1], [2], etc. as shown in the instructions field.
             error_data = {
                 "steps": [],
                 "response": error_msg,
-                "error": True
+                "error": error_msg  # Send the actual error message, not just True
             }
             yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n"
             return
@@ -1031,6 +1264,8 @@ Always cite sources using [1], [2], etc. as shown in the instructions field.
         
         # Determine if the query was handled successfully
         is_unhandled = any(pattern in result_str_lower for pattern in cannot_handle_patterns)
+        
+        # No separate completion message - the final response is enough
         
         # Send final response
         final_data = {
@@ -1122,13 +1357,33 @@ def run_agent_sync(query: str) -> str:
         )
         
         # All available tools - agent will choose which to use
-        tools = [get_weather_simple, web_search, webscraper, retrieve_knowledge]
+        # visit_webpage is our custom version with content truncation to prevent context overflow
+        tools = [get_weather_simple, web_search, webscraper, retrieve_knowledge, visit_webpage]
         
         # Custom instructions for better RAG handling (same as streaming version)
         # These will be injected into the system prompt via the instructions parameter
         custom_rag_instructions = """
 
 IMPORTANT: You MUST respond in English only. Never use Chinese or any other language in your responses.
+
+⚡ CHOOSE THE RIGHT TOOL:
+========================
+1. 🌤️ Weather → get_weather_simple(location)
+2. 📄 Document only → retrieve_knowledge()
+3. 🌐 Web search → web_search() or webscraper()
+4. 📄+🌐 Document + Web → BOTH retrieve_knowledge() AND web_search()
+5. ⚡ Verify results before final_answer()
+
+🌤️ WEATHER QUERIES:
+===================
+For weather questions: IMMEDIATELY call get_weather_simple(location)
+❌ DO NOT use web_search or webscraper for simple weather!
+
+📄 DOCUMENT + WEB COMBINATION:
+=============================
+✅ You CAN combine retrieve_knowledge() with web_search()
+✅ Example: "Compare document with current trends"
+   → retrieve_knowledge() for document + web_search() for trends
 
 CRITICAL RULES FOR DOCUMENT HANDLING:
 =====================================

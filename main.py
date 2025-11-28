@@ -42,6 +42,29 @@ async def health_check():
     return {"status": "ok"}
 
 
+# Cache stats endpoint
+@app.get("/cache/stats")
+async def cache_stats():
+    """Returns query cache statistics"""
+    try:
+        from huggingsmolagent.tools.query_cache import get_cache_stats
+        stats = get_cache_stats()
+        return stats
+    except ImportError:
+        return {"error": "Cache not available", "enabled": False}
+
+
+@app.post("/cache/clear")
+async def clear_cache():
+    """Clears the query cache"""
+    try:
+        from huggingsmolagent.tools.query_cache import clear_cache
+        clear_cache()
+        return {"status": "cache cleared", "success": True}
+    except ImportError:
+        return {"error": "Cache not available", "success": False}
+
+
 """
 Mount the smolagent streaming app at /agent (POST /agent/) to keep SSE streaming.
 We implement a unified /ask below that returns JSON and orchestrates upload/summarize/RAG/scrape.
@@ -210,17 +233,36 @@ Use retrieve_knowledge(query="...", top_k=20) to get the full document content.
 Note: Preview unavailable, but content is indexed. Use retrieve_knowledge() to access it.
 """
         
-        # Call smolagent with the enhanced query
-        from huggingsmolagent.agent import run_agent_sync
+        # Call smolagent with streaming to show steps in real-time
+        from huggingsmolagent.agent import generate_streaming_response, ComplexRequest
+        from fastapi.responses import StreamingResponse
         
         agent_query = query + context_msg if context_msg else query
         print(f"[ask] calling agent with enhanced query (length={len(agent_query)})")
         print(f"[ask] query preview: '{agent_query[:200]}...'")
         
-        result = run_agent_sync(agent_query)
-        print(f"[ask] smolagent response received length={len(str(result)) if result else 0}")
+        # Create request object for streaming agent
+        # If files were uploaded, mark RAG tool as selected
+        selected_tools = [{"name": "rag"}] if uploaded_context else None
         
-        return JSONResponse({"answer": result or "No response from agent"})
+        request_data = ComplexRequest(
+            toolsQuery=agent_query,
+            messages=[{"role": "user", "content": query}],
+            selectedTools=selected_tools,
+            conversationId=None,
+            chatSettings={}
+        )
+        
+        # Return streaming response with steps
+        return StreamingResponse(
+            generate_streaming_response(request_data),
+            media_type="application/x-ndjson",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
         
     except Exception as e:
         print("[ask] error:", e)

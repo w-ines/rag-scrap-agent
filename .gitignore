@@ -1,1 +1,13 @@
 .env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+agent_debug.log
+local_storage/

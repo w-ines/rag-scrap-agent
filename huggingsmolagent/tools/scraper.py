@@ -1373,8 +1373,15 @@ def web_search(query: str = None, messages: list = None, allowed_domains: list =
         if blocked_domains:
             domain_filters = " ".join([f"-site:{domain}" for domain in blocked_domains])
         
+        # 🔧 FIX: Enhance query for academic papers to prefer English research sources
+        enhanced_query = search_query
+        if any(keyword in search_query.lower() for keyword in ["paper", "research", "architecture", "model", "ai", "ml", "transformer"]):
+            # Add academic domain preferences for research queries
+            enhanced_query = f"{search_query} (site:arxiv.org OR site:paperswithcode.com OR site:huggingface.co OR site:github.com OR site:openreview.net)"
+            logger.info(f"📚 Enhanced academic query: {enhanced_query}")
+        
         # Combine filters with query (without allowed_domains)
-        full_query = f"{search_query} {domain_filters}".strip()
+        full_query = f"{enhanced_query} {domain_filters}".strip()
         
         logger.info(f"🔍 Executing search: '{full_query}' (max_results={max_results})")
         
@@ -1386,8 +1393,9 @@ def web_search(query: str = None, messages: list = None, allowed_domains: list =
         # Note: Only block domains that consistently return bad content
         blocked_after_search = [
             "reddit.com", "twitter.com", "x.com",  # Social media (CAPTCHA)
-            "baidu.com", "zhihu.com", "weibo.com",  # Chinese sites
+            "baidu.com", "zhihu.com", "weibo.com", "zhidao.baidu.com",  # Chinese sites
             "pinterest.com", "instagram.com", "facebook.com",  # Image/social sites
+            "bilibili.com", "qq.com", "sina.com.cn",  # More Chinese sites
             # Removed skyscrapercity.com and skyscraperpage.com - they can have valid data
             # Removed quora.com - sometimes has good answers
         ]
@@ -1402,15 +1410,34 @@ def web_search(query: str = None, messages: list = None, allowed_domains: list =
         
         # Check if search returned any results
         if not search_results:
-            logger.warning(f"❌ No search results for: '{search_query}'")
-            return {
-                "search_query": search_query,
-                "results": [],
-                "sources": [],
-                "context": "",
-                "error": "No search results found. Try a different query or check your connection.",
-                "instructions": "When answering the question, reference the sources inline by wrapping the index in brackets like this: [1]. If multiple sources are used, reference each without commas like this: [1][2][3]."
-            }
+            # 🔧 FIX: If enhanced query failed, try a simpler fallback without site restrictions
+            if enhanced_query != search_query:
+                logger.warning(f"⚠️ Enhanced query returned no results, trying simpler query...")
+                full_query = f"{search_query} {domain_filters}".strip()
+                logger.info(f"🔍 Fallback search: '{full_query}'")
+                search_results = search_web(full_query, max_results)
+                
+                # Filter blocked domains again
+                if search_results:
+                    original_count = len(search_results)
+                    search_results = [
+                        result for result in search_results 
+                        if not any(blocked in result.get("link", "") for blocked in blocked_after_search)
+                    ]
+                    if len(search_results) < original_count:
+                        logger.info(f"🚫 Filtered out {original_count - len(search_results)} blocked domains in fallback")
+            
+            # If still no results, return error
+            if not search_results:
+                logger.warning(f"❌ No search results for: '{search_query}'")
+                return {
+                    "search_query": search_query,
+                    "results": [],
+                    "sources": [],
+                    "context": "",
+                    "error": "No search results found. Try a different query or check your connection.",
+                    "instructions": "When answering the question, reference the sources inline by wrapping the index in brackets like this: [1]. If multiple sources are used, reference each without commas like this: [1][2][3]."
+                }
         
         logger.info(f"✅ Found {len(search_results)} search results")
         
@@ -1512,3 +1539,85 @@ def web_search(query: str = None, messages: list = None, allowed_domains: list =
             "results": [],
             "sources": []
         }
+
+
+# =============================================================================
+# CUSTOM visit_webpage TOOL WITH CONTENT TRUNCATION
+# =============================================================================
+# This overrides the default smolagents visit_webpage to prevent context overflow
+
+@tool
+def visit_webpage(url: str) -> str:
+    """
+    Visits a webpage at the given URL and reads its content as a markdown string.
+    Content is automatically truncated to prevent context overflow.
+    
+    Args:
+        url: The URL of the webpage to visit.
+        
+    Returns:
+        str: The main content of the webpage (truncated to ~3000 chars max)
+    """
+    MAX_CONTENT_LENGTH = 3000  # Limit to prevent LLM context overflow
+    
+    logger.info(f"🌐 visit_webpage called for: {url}")
+    
+    try:
+        # Use BeautifulSoup for fast content extraction
+        session = requests.Session()
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+        }
+        
+        response = session.get(url, headers=headers, timeout=20, verify=False)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Remove script, style, nav, footer, header elements
+        for element in soup(['script', 'style', 'nav', 'footer', 'header', 'aside', 'form', 'iframe']):
+            element.decompose()
+        
+        # Try to find main content
+        main_content = None
+        for selector in ['main', 'article', '[role="main"]', '.content', '#content', '.post', '.article']:
+            main_content = soup.select_one(selector)
+            if main_content:
+                break
+        
+        if not main_content:
+            main_content = soup.find('body') or soup
+        
+        # Extract text
+        text = main_content.get_text(separator='\n', strip=True)
+        
+        # Clean up excessive whitespace
+        lines = [line.strip() for line in text.split('\n') if line.strip()]
+        text = '\n'.join(lines)
+        
+        # Get title
+        title = soup.find('title')
+        title_text = title.get_text(strip=True) if title else ""
+        
+        # Truncate content
+        if len(text) > MAX_CONTENT_LENGTH:
+            text = text[:MAX_CONTENT_LENGTH]
+            # Cut at last complete sentence or paragraph
+            last_period = text.rfind('.')
+            last_newline = text.rfind('\n')
+            cut_point = max(last_period, last_newline)
+            if cut_point > MAX_CONTENT_LENGTH * 0.7:
+                text = text[:cut_point + 1]
+            text += "\n\n[... content truncated for brevity ...]"
+        
+        result = f"# {title_text}\n\n{text}" if title_text else text
+        
+        logger.info(f"✅ visit_webpage extracted {len(result)} chars from {url}")
+        return result
+        
+    except Exception as e:
+        error_msg = f"Error visiting {url}: {str(e)}"
+        logger.error(f"❌ {error_msg}")
+        return error_msg
